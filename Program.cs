@@ -383,9 +383,9 @@ namespace KucoinGridBot
     {
         public static async Task Main()
         {
-            const string key = "6822123d61d41900017228b5";
-            const string secret = "8442d315-2148-4712-9890-6fae76c984c4";
-            const string pass = "0018097677";
+            const string key = "";
+            const string secret = "";
+            const string pass = "";
             const string symbol = "BTC-USDT";
 
             using var api = new KucoinApi(key, secret, pass);
