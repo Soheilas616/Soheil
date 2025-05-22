@@ -13,7 +13,7 @@ using System.Collections.Generic;
 namespace KucoinGridBot
 {
     //───────────────────────────────────────────────────────────────────────────────
-    // جلوگیری از خواب رفتن سیستم
+    // جلوگیری از خواب رفتن ویندوز
     //───────────────────────────────────────────────────────────────────────────────
     static class SleepManager
     {
@@ -22,13 +22,12 @@ namespace KucoinGridBot
         private const uint ES_CONTINUOUS = 0x80000000;
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_AWAYMODE_REQUIRED = 0x00000040;
-
         public static void PreventSleep() =>
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
     }
 
     //───────────────────────────────────────────────────────────────────────────────
-    // وضعیت ربات (برای ری‌استارت)
+    // وضعیت ربات برای پایداری ری‌استارت
     //───────────────────────────────────────────────────────────────────────────────
     class BotState
     {
@@ -44,7 +43,57 @@ namespace KucoinGridBot
     class InstrumentSpec { public decimal TickSize; public int LotPrecision; public decimal MinSize; }
 
     //───────────────────────────────────────────────────────────────────────────────
-    // لایه دسترسی به API کوکوین
+    // توابع اندیکاتور EMA و RSI
+    //───────────────────────────────────────────────────────────────────────────────
+    static class Indicators
+    {
+        public static List<decimal> EMA(decimal[] values, int period)
+        {
+            var ema = new List<decimal>();
+            if (values.Length < period) return ema;
+            decimal sum = 0m;
+            for (int i = 0; i < period; i++) sum += values[i];
+            decimal prev = sum / period;
+            ema.Add(prev);
+            decimal mult = 2m / (period + 1);
+            for (int i = period; i < values.Length; i++)
+            {
+                prev = (values[i] - prev) * mult + prev;
+                ema.Add(prev);
+            }
+            return ema;
+        }
+
+        public static List<decimal> RSI(decimal[] values, int period)
+        {
+            var rsis = new List<decimal>();
+            if (values.Length <= period) return rsis;
+            decimal gain = 0m, loss = 0m;
+            for (int i = 1; i <= period; i++)
+            {
+                var change = values[i] - values[i - 1];
+                if (change > 0) gain += change;
+                else loss -= change;
+            }
+            decimal avgGain = gain / period;
+            decimal avgLoss = loss / period;
+            rsis.Add(avgLoss == 0 ? 100m : 100m - (100m / (1m + avgGain / avgLoss)));
+
+            for (int i = period + 1; i < values.Length; i++)
+            {
+                var change = values[i] - values[i - 1];
+                decimal g = change > 0 ? change : 0;
+                decimal l = change < 0 ? -change : 0;
+                avgGain = ((avgGain * (period - 1)) + g) / period;
+                avgLoss = ((avgLoss * (period - 1)) + l) / period;
+                rsis.Add(avgLoss == 0 ? 100m : 100m - (100m / (1m + avgGain / avgLoss)));
+            }
+            return rsis;
+        }
+    }
+
+    //───────────────────────────────────────────────────────────────────────────────
+    // لایه‌ی دسترسی به API کوکوین
     //───────────────────────────────────────────────────────────────────────────────
     class KucoinApi : IDisposable
     {
@@ -142,6 +191,17 @@ namespace KucoinGridBot
             throw new Exception("Symbol not found");
         }
 
+        public async Task<decimal[]> FetchClosesAsync(string sym, int limit = 100)
+        {
+            var end = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var start = end - limit * 60;
+            var path = $"/api/v1/market/candles?type=1min&symbol={sym}"
+                      + $"&startAt={start}&endAt={end}";
+            var arr = (await SendAsync(() => CreateRequest(HttpMethod.Get, path)))
+                      .EnumerateArray();
+            return arr.Select(e => ParseDecimal(e[2])).ToArray();
+        }
+
         public async Task<string> PlaceLimitAsync(string sym, string side, decimal price, decimal size)
         {
             var body = JsonSerializer.Serialize(new
@@ -164,7 +224,6 @@ namespace KucoinGridBot
         {
             var d = await SendAsync(() =>
                 CreateRequest(HttpMethod.Get, $"/api/v1/orders/{id}"));
-
             var filled = d.TryGetProperty("dealSize", out var ds) ? ds
                        : d.TryGetProperty("filledSize", out var fs) ? fs
                        : default;
@@ -195,7 +254,7 @@ namespace KucoinGridBot
                 CreateRequest(HttpMethod.Get,
                   $"/api/v1/orders?symbol={sym}&status=active"));
             JsonElement items = data.ValueKind == JsonValueKind.Object
-                                && data.TryGetProperty("items", out var arr) ? arr
+                                  && data.TryGetProperty("items", out var arr) ? arr
                                 : data.ValueKind == JsonValueKind.Array ? data
                                 : default;
             if (items.ValueKind == JsonValueKind.Array)
@@ -208,7 +267,7 @@ namespace KucoinGridBot
     }
 
     //───────────────────────────────────────────────────────────────────────────────
-    // منطق گرید تریدینگ
+    // منطق گرید تریدینگ با فیلتر EMA/RSI
     //───────────────────────────────────────────────────────────────────────────────
     class GridTrader
     {
@@ -216,6 +275,7 @@ namespace KucoinGridBot
         private readonly string _symbol;
         private readonly int _levels;
         private readonly decimal _profitPct, _stopLossPct, _riskUsd;
+        private readonly TimeSpan _maxIdle = TimeSpan.FromHours(2);
         private readonly string _stateFile = "bot_state.json";
         private BotState _state = new();
 
@@ -234,6 +294,7 @@ namespace KucoinGridBot
 
         public async Task RunForeverAsync()
         {
+            Console.WriteLine("Starting ENHANCED GRID TRADER…");
             while (true)
             {
                 try
@@ -242,7 +303,8 @@ namespace KucoinGridBot
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ERROR] {ex.Message}, restarting in 10s...");
+                    Console.WriteLine($"[ERROR] {ex.Message}, resetting state and restarting in 10s...");
+                    ResetState();
                     await Task.Delay(10_000);
                 }
             }
@@ -253,46 +315,75 @@ namespace KucoinGridBot
             SleepManager.PreventSleep();
             LoadState();
 
-            // یک‌بار گرفتن مشخصات نماد
+            // ────────────────────────────────────────────────────────────────────
+            // 1) مشخصات نماد
             var spec = await _api.FetchInstrumentInfoAsync(_symbol);
             decimal tick = spec.TickSize;
             int prec = spec.LotPrecision;
-            string fmt = "F" + prec; // برای چاپ عدد با دقت متغیر
+            string fmt = "F" + prec;
 
+            // 2) قیمت وسط بازار
+            var t0 = await _api.FetchTickerAsync(_symbol);
+            decimal mid = (t0.Bid + t0.Ask) / 2m;
+
+            // 3) فیلتر روند: EMA10>EMA30 & RSI14<70
+            var closes = await _api.FetchClosesAsync(_symbol, 100);
+            var ema10 = Indicators.EMA(closes, 10);
+            var ema30 = Indicators.EMA(closes, 30);
+            var rsi14 = Indicators.RSI(closes, 14);
+            var lastEma10 = ema10.Any() ? ema10.Last() : mid;
+            var lastEma30 = ema30.Any() ? ema30.Last() : mid;
+            var lastRsi = rsi14.Any() ? rsi14.Last() : 50m;
+            if (!(lastEma10 > lastEma30 && lastRsi < 70m))
+            {
+                Console.WriteLine(
+                  $"🔶 Trend not OK (EMA10={lastEma10.ToString(fmt)}, EMA30={lastEma30.ToString(fmt)}, RSI={lastRsi:F0}), skipping.");
+                await Task.Delay(500);
+                return;
+            }
+
+            // 4) Idle reset: اگر برای maxIdle اتفاقی نیفتاده باشه
+            if (_state.BuysPlaced &&
+                DateTime.UtcNow - _state.StartTime > _maxIdle)
+            {
+                Console.WriteLine($"⏱ {_maxIdle.TotalHours}h idle → reset");
+                await _api.CancelAllAsync(_symbol);
+                ResetState();
+                return;
+            }
+
+            // 5) ثبت اولیه گرید Buy
             if (!_state.BuysPlaced)
             {
-                var t0 = await _api.FetchTickerAsync(_symbol);
-                decimal mid = (t0.Bid + t0.Ask) / 2m;
+                if (_levels < 2)
+                    throw new Exception("levels must be >= 2");
 
                 // محاسبه قیمت‌های گرید
                 _state.BuyPrices = Enumerable.Range(0, _levels)
                     .Select(i =>
                         Math.Round(
-                            mid * (1 - _profitPct + 2 * _profitPct * i / (_levels - 1))
+                            mid * (1 - _profitPct + 2m * _profitPct * i / (_levels - 1))
                             / tick,
                             MidpointRounding.AwayFromZero
                         ) * tick
                     ).ToList();
 
-                // حجم هر سفارش
+                // محاسبه حجم هر سفارش
                 decimal rawQ = (_riskUsd / _levels) / mid;
                 _state.Qty = Math.Max(
                                   Math.Round(rawQ, prec, MidpointRounding.AwayFromZero),
                                   spec.MinSize
                                 );
 
-                // پاک‌کردن سفارش‌های قبلی
+                // کنسل سفارش‌های قبلی و ثبت گرید
                 await _api.CancelAllAsync(_symbol);
-
-                // ثبت سطح‌های خرید
                 for (int i = 0; i < _levels; i++)
                 {
-                    decimal price = _state.BuyPrices[i];
-                    string oid = await _api.PlaceLimitAsync(
-                                         _symbol, "buy", price, _state.Qty);
+                    var price = _state.BuyPrices[i];
+                    var oid = await _api.PlaceLimitAsync(
+                                    _symbol, "buy", price, _state.Qty);
                     _state.BuyOrderIds.Add(oid);
-                    Console.WriteLine(
-                        $"[GRID BUY {i + 1}/{_levels}] @ {price.ToString(fmt)}");
+                    Console.WriteLine($"[GRID BUY {i + 1}/{_levels}] @ {price.ToString(fmt)}");
                 }
 
                 _state.StartTime = DateTime.UtcNow;
@@ -300,65 +391,55 @@ namespace KucoinGridBot
                 SaveState();
             }
 
-            // حلقهٔ مانیتورینگ
-            while (true)
+            // 6) مانیتور پر شدن BUY و ثبت SELL
+            foreach (var idx in Enumerable.Range(0, _state.BuyOrderIds.Count))
             {
-                var t = await _api.FetchTickerAsync(_symbol);
-
-                // ری‌ست پس از ۱ ساعت
-                if (DateTime.UtcNow - _state.StartTime > TimeSpan.FromHours(1))
+                var oid = _state.BuyOrderIds[idx];
+                if (string.IsNullOrEmpty(oid)) continue;
+                var os = await _api.GetOrderStatusAsync(oid);
+                if (os.Status == "done")
                 {
-                    Console.WriteLine("⏱ 1h elapsed → reset");
-                    await _api.CancelAllAsync(_symbol);
-                    ResetState();
-                    return;
+                    decimal buyPrice = _state.BuyPrices[idx];
+                    decimal sellPrice = Math.Round(
+                        buyPrice * (1 + _profitPct) / tick,
+                        MidpointRounding.AwayFromZero
+                    ) * tick;
+
+                    Console.WriteLine(
+                        $"🟢 FILLED BUY @ {buyPrice.ToString(fmt)}, placing SELL @ {sellPrice.ToString(fmt)}"
+                    );
+                    await _api.PlaceLimitAsync(_symbol, "sell", sellPrice, _state.Qty);
+
+                    // حذف از لیست تا دوباره بررسی نشود
+                    _state.BuyOrderIds[idx] = "";
+                    SaveState();
                 }
-
-                // چک تک‌تک سفارش‌ها
-                for (int i = 0; i < _state.BuyOrderIds.Count; i++)
-                {
-                    var oid = _state.BuyOrderIds[i];
-                    if (string.IsNullOrEmpty(oid)) continue;
-
-                    var os = await _api.GetOrderStatusAsync(oid);
-                    if (os.Status == "done")
-                    {
-                        decimal buyPrice = _state.BuyPrices[i];
-                        decimal unrounded = buyPrice * (1 + _profitPct);
-                        decimal sellPrice = Math.Round(
-                            unrounded / tick,
-                            MidpointRounding.AwayFromZero
-                        ) * tick;
-
-                        Console.WriteLine(
-                            $"🟢 FILLED BUY @ {buyPrice.ToString(fmt)}, placing SELL @ {sellPrice.ToString(fmt)}");
-                        await _api.PlaceLimitAsync(_symbol, "sell", sellPrice, _state.Qty);
-
-                        // علامت‌گذاری به‌عنوان انجام‌شده
-                        _state.BuyOrderIds[i] = "";
-                        SaveState();
-                    }
-                }
-
-                // حد ضرر
-                decimal worstBuy = _state.BuyPrices.Min();
-                if (t.Bid <= worstBuy * (1 - _stopLossPct))
-                {
-                    Console.WriteLine($"🔴 STOP-LOSS @ {t.Bid.ToString(fmt)}");
-                    await _api.CancelAllAsync(_symbol);
-                    ResetState();
-                    return;
-                }
-
-                await Task.Delay(500);
             }
+
+            // 7) Stop‐Loss کلی
+            var worstBuy = _state.BuyPrices.Min();
+            if (t0.Bid <= worstBuy * (1 - _stopLossPct))
+            {
+                Console.WriteLine($"🔴 STOP‐LOSS @ {t0.Bid.ToString(fmt)}");
+                await _api.CancelAllAsync(_symbol);
+                ResetState();
+                return;
+            }
+
+            await Task.Delay(500);
         }
 
         private void LoadState()
         {
             if (File.Exists(_stateFile))
-                _state = JsonSerializer.Deserialize<BotState>(
-                             File.ReadAllText(_stateFile))!;
+            {
+                try
+                {
+                    _state = JsonSerializer.Deserialize<BotState>(
+                        File.ReadAllText(_stateFile))!;
+                }
+                catch { /* ignore on parse fail */ }
+            }
         }
 
         private void SaveState()
@@ -377,15 +458,15 @@ namespace KucoinGridBot
     }
 
     //───────────────────────────────────────────────────────────────────────────────
-    // نقطهٔ ورود برنامه
+    // نقطه‌ٔ ورود برنامه
     //───────────────────────────────────────────────────────────────────────────────
     static class Program
     {
         public static async Task Main()
         {
-            const string key = "";
-            const string secret = "";
-            const string pass = "";
+            const string key = "6822123d61d41900017228b5";
+            const string secret = "8442d315-2148-4712-9890-6fae76c984c4";
+            const string pass = "0018097677";
             const string symbol = "BTC-USDT";
 
             using var api = new KucoinApi(key, secret, pass);
@@ -394,11 +475,10 @@ namespace KucoinGridBot
                 symbol,
                 levels: 5,
                 profitPct: 0.005m,   // 0.5%
-                totalRiskUsd: 5.0m,     // $5
-                stopLossPct: 0.015m    // 1.5%
+                totalRiskUsd: 5.0m,     // $5 risk total
+                stopLossPct: 0.015m    // 1.5% stop-loss
             );
 
-            Console.WriteLine("Starting SHORT-TERM GRID TRADER…");
             await bot.RunForeverAsync();
         }
     }
